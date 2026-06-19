@@ -1,0 +1,30 @@
+## FMAttack test topology
+## 1 VCS, 4 SLD devices
+## Tenant 1 owns vppb 0,1 (ports 1,2)
+## Tenant 2 owns vppb 2,3 (ports 3,4)
+## No authentication on FMAPI - all attacks exploit this
+
+port_configs:
+  - type: USP
+  - type: DSP
+  - type: DSP
+  - type: DSP
+  - type: DSP
+virtual_switch_configs:
+  - upstream_port_index: 0
+    vppb_counts: 4
+    initial_bounds: [1,2,3,4]
+devices:
+  single_logical_devices:
+    - port_index: 1
+      memory_size: 256M
+      serial_number: AAAA000000000001
+    - port_index: 2
+      memory_size: 256M
+      serial_number: AAAA000000000002
+    - port_index: 3
+      memory_size: 256M
+      serial_number: BBBB000000000003
+    - port_index: 4
+      memory_size: 256M
+      serial_number: BBBB000000000004

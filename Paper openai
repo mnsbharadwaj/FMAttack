@@ -1,0 +1,179 @@
+FMAttack: Exploiting the Unauthenticated CXL Fabric Manager Control Plane
+
+Abstract
+
+Compute Express Link (CXL) 3.x introduces the Fabric Manager (FM) as the privileged orchestration entity responsible for topology configuration, dynamic capacity allocation, and management command routing across disaggregated memory fabrics. While existing CXL security mechanisms such as SPDM and Trusted Security Protocol (TSP) protect device identity and memory confidentiality, the Fabric Manager control plane remains largely outside the formal security perimeter. In this paper, we demonstrate that unauthenticated Fabric Manager API (FMAPI) operations enable cross-tenant attacks capable of compromising confidentiality, integrity, and availability of CXL resources. We identify three critical attack classes: cross-tenant device reassignment, fabric-level denial-of-service, and unauthorized Dynamic Capacity Device (DCD) memory reallocation. To evaluate the practical impact, we implement a high-fidelity CXL fabric emulator incorporating virtual CXL switches, vPPBs, DCD memory pools, and FMAPI command handlers. Experimental results show that all attacks succeed with 100% reliability and require only microseconds of execution time. We further propose ZTFM (Zero-Trust Fabric Manager), a software-only defense architecture that combines SPDM-bound authentication, resource ownership enforcement, and semantic command validation. ZTFM blocks all identified attacks while introducing less than 5 μs overhead per FMAPI transaction. Our results demonstrate that FM control-plane security must become a first-class design requirement for future CXL deployments.
+
+Keywords—CXL, Fabric Manager, FMAPI, Memory Disaggregation, Security, DCD, Multi-Tenant Systems
+
+I. Introduction
+
+A. Background
+
+- Growth of memory disaggregation
+- CXL 3.x and pooled memory
+- Role of Fabric Manager
+
+B. Problem Statement
+
+- FM possesses root authority
+- FMAPI commands lack normative authentication requirements
+- Security implications
+
+C. Contributions
+
+1. Identification of three FMAPI attack classes.
+2. Formal analysis of specification gaps.
+3. Experimental validation using a CXL fabric emulator.
+4. Design and implementation of ZTFM.
+5. Quantitative evaluation of security and performance.
+
+II. Background
+
+A. CXL Fabric Architecture
+
+- PBR switches
+- VCS
+- vPPB
+- DCD
+- Multi-tenant operation
+
+B. Fabric Manager API
+
+- Port management
+- Device assignment
+- DCD operations
+
+C. Existing Security Mechanisms
+
+- SPDM
+- IDE
+- TSP
+
+D. Security Limitations
+
+Why these mechanisms do not protect FMAPI.
+
+III. Threat Model
+
+A. Assumptions
+
+B. Adversary Capabilities
+
+C. Assets
+
+D. Security Objectives
+
+IV. Vulnerability Analysis
+
+A. GAP-1: Unauthenticated vPPB Operations
+
+B. GAP-2: Unrestricted Port State Control
+
+C. GAP-3: Unauthenticated DCD Extent Management
+
+D. Root Cause Analysis
+
+Control-plane trust assumptions.
+
+V. FMAttack
+
+A. Attack 1: Cross-Tenant Device Hijack
+
+(Figure 1)
+
+B. Attack 2: Fabric-Level Denial of Service
+
+(Figure 2)
+
+C. Attack 3: DCD Memory Theft
+
+(Figure 3)
+
+D. Attack Complexity Analysis
+
+E. Security Impact
+
+Confidentiality
+Integrity
+Availability
+
+VI. ZTFM: Zero-Trust Fabric Manager
+
+A. Design Goals
+
+B. Architecture
+
+(Figure 4)
+
+C. Authentication Layer
+
+SPDM-bound session establishment.
+
+D. Authorization Layer
+
+Ownership graph.
+
+E. Semantic Validation Layer
+
+Policy enforcement.
+
+F. Secure Logging
+
+G. Formal Security Properties
+
+Isolation Property
+
+Command Authenticity Property
+
+Ownership Preservation Property
+
+VII. Experimental Methodology
+
+A. Emulator Architecture
+
+(Figure 5)
+
+B. Fabric Configuration
+
+C. Workloads
+
+D. Metrics
+
+VIII. Evaluation
+
+A. Attack Success Rate
+
+B. Attack Latency
+
+C. Security Coverage
+
+D. Defense Overhead
+
+E. Scalability Analysis
+
+F. Sensitivity Analysis
+
+IX. Discussion
+
+A. Implications for CXL 4.0
+
+B. Deployment Considerations
+
+C. Limitations
+
+D. Future Standardization Opportunities
+
+X. Related Work
+
+A. PCIe Security
+
+B. Memory Disaggregation Security
+
+C. Control Plane Security
+
+D. Hardware Resource Isolation
+
+XI. Conclusion
+
+The Fabric Manager constitutes a critical trust anchor in modern CXL fabrics. We demonstrate that unauthenticated FMAPI operations enable cross-tenant compromise through device reassignment, denial-of-service, and memory reallocation attacks. We propose ZTFM, a zero-trust control-plane architecture that eliminates these vulnerabilities without hardware modification. Experimental evaluation shows complete mitigation of all attack classes with negligible overhead, highlighting the need for authenticated and authorized FM operation in future CXL deployments.

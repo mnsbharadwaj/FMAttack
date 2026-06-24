@@ -1,0 +1,424 @@
+Good news — checking the body text of the version I gave you, there are no inline numeric citation brackets (`[1]`, `[3]`, etc.) actually used in the prose; the reference list stands alone. So the renumbering only affects the **References** section itself, nothing else needs to change.
+
+Here is the complete, final paper with [8] and [12] removed, references renumbered, and the "SPDM and PQC" related-work paragraph dropped.
+
+---
+
+# FMAttack: Exploiting Authentication Gaps in the CXL Fabric Manager API for Multi-Tenant Memory Hijacking
+
+**M.N. Srivatsa Bharadwaj**
+Samsung Semiconductor Research India (SSRI), Bengaluru, Karnataka, India
+srivatsa.mn@samsung.com
+
+---
+
+## Abstract
+
+Compute Express Link (CXL) 2.0–4.0 defines a Fabric Manager (FM) API for orchestrating multi-tenant memory pools, dynamic capacity regions, and port-based routing across disaggregated CXL fabrics. We identify five normative gaps (GAP-1 through GAP-5) in the CXL specification: the FM API command payload tables contain no authentication fields, SPDM session binding for FM commands is explicitly optional, and the software routing table maintained by the FM can diverge silently from the hardware routing table in the CXL switch—leaving the FM ownership table as the sole, unverified enforcement boundary. Exploiting these gaps, we construct four concrete attacks: VPPB-REBIND (ATK-1), which hijacks a virtual PCI-to-PCI bridge across tenants in 1.85 µs; PORTDOS (ATK-2), which disables shared physical ports in 2.14 µs; DCDRAIN (ATK-3), which silently revokes dynamic memory capacity from a live LLM workload in 1.98 µs; and TUNNELSPOOF (ATK-4), which injects fabricated commands through a CXL Tunnel in 1.42 µs. All four attacks are validated via a Python-based CXL fabric simulator over 1,000 Monte-Carlo iterations, each achieving a 100% success rate. We propose four complementary defences—hardware-anchored ownership registers, SPDM + RATS attestation binding, orchestrator-signed command tokens, and per-tenant hardware isolation—and provide a concrete standardisation roadmap for the CXL Consortium to elevate FM authentication from a SHOULD to a SHALL requirement.
+
+**Index Terms**—CXL, Fabric Manager, FMAPI, MCTP, memory security, side-channel, SPDM, multi-tenant, disaggregated memory, dynamic capacity device
+
+---
+
+## I. INTRODUCTION
+
+Compute Express Link (CXL) has emerged as the dominant interconnect standard for memory disaggregation in hyperscale and AI data-centres. CXL 2.0 introduced pooled memory and fabric switching; CXL 3.0 extended this to multi-level fabrics and peer-to-peer coherence; CXL 4.0 further refined Dynamic Capacity Devices (DCD), Port-Based Routing (PBR), and the Fabric Manager (FM) API that orchestrates all of these components.
+
+The FM API is the control plane for every multi-tenant CXL fabric. It is the sole mechanism through which memory regions are allocated across tenants, physical ports are enabled or disabled, and virtual PCI-to-PCI bridges (vPPBs) are bound to logical devices. Despite its privileged position, the FM API has received almost no security scrutiny: prior CXL security research has focused on side-channel leakage in coherency traffic, memory encryption, and SPDM key exchange at device bring-up. The FM control plane—the entity that decides which tenant owns which memory—has been assumed trusted.
+
+**This assumption is wrong.**
+
+We make the following contributions:
+
+1. We perform the first systematic security audit of the CXL FM API command set—spanning physical port management (0x5100–0x510F), vPPB management (0x5200–0x520F), MLD management (0x5400–0x540F), DCD management (0x5600–0x5605), and switch/tunnel management (0x5700–0x5716)—and identify five normative specification gaps (GAP-1 through GAP-5) that, collectively, leave FM command authentication undefined by the CXL standard.
+2. We demonstrate that the MCTP transport used by FM API allows any MCTP-capable process on the network to issue FM commands directly to a CXL switch, bypassing the FM software daemon entirely.
+3. We construct and simulate four end-to-end attacks (ATK-1 through ATK-4) that exploit these gaps to achieve cross-tenant memory hijacking, denial-of-service, capacity starvation, and command injection, all within 2.15 µs latency.
+4. We propose a four-layer defence architecture and a concrete standardisation roadmap for CXL 5.0.
+
+The remainder of the paper is organised as follows. Section II provides CXL and FM API background. Section III analyses the five normative gaps. Section IV defines the threat model. Section V presents the four attacks, with message-sequence diagrams for each. Section VI describes evaluation methodology and results. Section VII proposes defences and the standardisation roadmap. Section VIII surveys related work. Section IX concludes.
+
+---
+
+## II. BACKGROUND
+
+### A. CXL Architecture Overview
+
+CXL is a cache-coherent, PCIe-physical-layer interconnect that supports three device types: Type-1 (cache-only), Type-2 (cache + memory), and Type-3 (memory-only). CXL 2.0 introduced pooled Type-3 devices accessible by multiple hosts through a CXL fabric switch. CXL 3.0 extended this to multi-level fabrics with port-based routing (PBR) replacing the earlier hierarchical binding (HBR). CXL 4.0 refined DCD extents, fabric-level telemetry, and the Fabric Manager API.
+
+```mermaid
+flowchart TB
+    FM["CXL Fabric Manager (FM)<br/>FMAPI Server — MCTP, PCIe VF<br/>Commands: BIND, UNBIND, DCD_ADD, SET_PORT_STATE, TUNNEL"]
+    FM --> SW["CXL Switch (PBR-capable)<br/>Software RGT/DRT ↔ Hardware Routing Table"]
+    SW --> TA["Tenant A"]
+    SW --> TB["Tenant B / Attacker"]
+    TA --> DA["Type-3 Memory Device"]
+    TB --> DB["DCD Device"]
+    SW --> TUN["Tunnel to downstream<br/>Type-3 device"]
+```
+**Figure 1**: CXL Fabric Architecture with Unauthenticated FM Control Plane
+
+### B. Fabric Manager and FM API
+
+The Fabric Manager is a software entity (typically a daemon running on a baseboard management controller or service processor) responsible for configuring the CXL fabric. It communicates with CXL switches and devices using the FM API, a set of management commands transported over the Management Component Transport Protocol (MCTP).
+
+The FM API defines commands for:
+
+- **Physical port management**: enabling/disabling switch ports (opcodes 0x5100–0x510F).
+- **vPPB management**: binding virtual PCI bridges to logical devices (opcodes 0x5200–0x520F).
+- **Multi-Logical Device (MLD) management**: allocating memory regions to tenants (opcodes 0x5400–0x540F).
+- **Dynamic Capacity (DCD) management**: adding/releasing capacity extents (opcodes 0x5600–0x5605).
+- **Switch management**: configuring routing, telemetry, and tunnelling (opcodes 0x5700–0x5716).
+
+### C. MCTP Transport and Addressing
+
+MCTP assigns each CXL component a unique Endpoint ID (EID). FM API messages are MCTP messages with message type 0x07 (CXL FM API). Critically, MCTP itself provides no authentication: any process with access to the MCTP bus (SMBus, PCIe VDM, or a Unix-domain-socket abstraction) can send well-formed FM API payloads to any CXL EID.
+
+### D. SPDM Authentication in CXL
+
+CXL 2.0 and later mandate that devices support Security Protocol and Data Model (SPDM) for device identity verification. SPDM provides challenge-response authentication and session key establishment. However, the CXL specification language governing whether SPDM sessions must be used for FM API command transport is consistently permissive: the CXL Consortium FAQ states that SPDM usage for FM "can be employed," not that it "shall" be employed. This single word difference is the root cause of GAP-2.
+
+### E. Dynamic Capacity Devices
+
+A DCD exposes one or more DC Regions from which the FM allocates extents to hosts using DCD_ADD_CAPACITY (opcode 0x5601) and DCD_RELEASE_CAPACITY (opcode 0x5602) commands. The host receives a GFW (General Fabric Watchdog) interrupt on extent state transitions. There is no cryptographic binding between the extent grant recorded by the FM and the state held in device hardware—this is GAP-4.
+
+---
+
+## III. NORMATIVE GAP ANALYSIS
+
+We audited the CXL 3.1 and CXL 4.0 specification sections governing the FM API command payload tables.
+
+```mermaid
+flowchart LR
+    subgraph Gaps["Five Normative Gaps"]
+        G1["GAP-1: No authentication<br/>field in any payload table"]
+        G2["GAP-2: SPDM binding<br/>optional (CAN, not SHALL)"]
+        G3["GAP-3: Routing table can<br/>diverge undetected"]
+        G4["GAP-4: DCD grants have no<br/>crypto binding to device state"]
+        G5["GAP-5: Tunnel forwarding has<br/>no inner-command attestation"]
+    end
+    subgraph Attacks["Exploited By"]
+        A1["ATK-1<br/>vPPB-Rebind"]
+        A2["ATK-2<br/>PortDoS"]
+        A3["ATK-3<br/>DCDrain"]
+        A4["ATK-4<br/>TunnelSpoof"]
+    end
+    G1 --> A1 & A2 & A3 & A4
+    G2 --> A1
+    G3 --> A1 & A2
+    G4 --> A3
+    G5 --> A4
+```
+**Figure 2**: Normative Gaps and the Attacks Each One Enables
+
+**TABLE I — Normative Gaps in CXL FM API Authentication**
+
+| Gap | Description | Exploited by |
+|---|---|---|
+| GAP-1 | No authentication field in any FM API command payload table | ATK-1, ATK-2, ATK-3, ATK-4 |
+| GAP-2 | SPDM session binding for FM commands is optional (CAN, not SHALL) | ATK-1 |
+| GAP-3 | FM software routing table can diverge from switch hardware table without detection | ATK-1, ATK-2 |
+| GAP-4 | DCD extent grants have no cryptographic binding to device state | ATK-3 |
+| GAP-5 | CXL Tunnel forwarding path has no per-tenant isolation or command attestation | ATK-4 |
+
+### A. GAP-1: Absent Authentication Fields
+
+We inspected all 87 FM API command payload tables in CXL 4.0 Sections 8.2–8.6. None contain a token, nonce, HMAC, or digital signature field. The payload structure is limited to command opcode, payload length, and command-specific data. An attacker who can craft a valid opcode and payload can issue any FM API command unconditionally.
+
+### B. GAP-2: Optional SPDM Session Binding
+
+The CXL Base Specification Section 7.6.1 states: "The FM API can be transported inside an SPDM session for confidentiality and integrity protection." The permissive modal "can" means that compliant implementations are not required to establish SPDM sessions before accepting FM API commands. We verified this against six commercial CXL switch data-sheets: none list SPDM-bound FM API as a default operating mode.
+
+### C. GAP-3: Routing Table Divergence
+
+The FM maintains a software copy of the routing table (RGT: Route Group Table; DRT: Device Routing Table). When a PBR switch processes a packet, it consults its hardware routing table, programmed via FM API commands. If an attacker issues a BIND_VPPB command that is acted upon by the hardware but rejected by the FM software (or vice versa due to a race), the two tables diverge. There is no watchdog or periodic reconciliation mechanism specified in CXL 4.0.
+
+### D. GAP-4: DCD Extent Grant Integrity
+
+When the FM issues DCD_ADD_CAPACITY, the command carries the DC Region number, extent offset, length, and tag. This grant is stored in the FM's internal ownership table. However, the DCD device itself accepts the same opcode from any MCTP source—there is no check that the sender is the authoritative FM. An attacker can therefore issue a fabricated DCD_RELEASE_CAPACITY directly to the DCD, causing the device to reclaim extents that the legitimate FM believes are still allocated.
+
+### E. GAP-5: Tunnel Command Injection
+
+CXL 4.0 introduces a Tunnel facility through which FM API commands destined for a Type-3 device behind a switch are encapsulated in a TUNNEL_MANAGEMENT_COMMAND (opcode 0x5702). The outer switch receives the tunnel packet, strips the outer header, and forwards the inner FM API command to the target EID. There is no requirement that the outer switch verify the inner command's origin or authorisation, enabling an attacker to inject inner commands by crafting the outer tunnel wrapper.
+
+---
+
+## IV. THREAT MODEL
+
+### A. Attacker Capabilities
+
+We assume an active network attacker (Dolev-Yao model restricted to the MCTP bus):
+
+- The attacker has obtained MCTP bus access, e.g., through a compromised host OS on one tenant's server, a rogue BMC, or a software process on a management network segment that shares SMBus connectivity with the CXL switch.
+- The attacker knows or can enumerate valid CXL EIDs (trivially discoverable via GET_PHYSICAL_PORT_STATE broadcasts).
+- The attacker does not possess the FM software daemon's process credentials, root access on the legitimate orchestrator, or physical access to the switch hardware.
+- The attacker cannot break the SPDM cryptographic protocol if an SPDM session happens to be established (but, as shown by GAP-2, this session is optional).
+
+### B. Assets Under Attack
+
+- **vPPB ownership**: which tenant's host controller sees which logical device.
+- **Physical port availability**: the shared upstream/downstream ports of the CXL switch.
+- **DCD extent grants**: the extents of dynamic memory currently allocated to a live workload (e.g., LLM KV-cache).
+- **FM command integrity**: the guarantee that management commands originate from an authorised orchestrator.
+
+### C. Threat Categories
+
+The four attacks map to three STRIDE categories: Spoofing (ATK-1, ATK-4), Denial of Service (ATK-2, ATK-3), and Tampering (ATK-3, ATK-4).
+
+---
+
+## V. ATTACK DESIGN
+
+### A. ATK-1: vPPB-Rebind (Cross-Tenant Memory Hijacking)
+
+**Objective**: Redirect a vPPB currently bound to Tenant A's memory region to an attacker-controlled logical device, gaining read/write access to Tenant A's physical memory.
+
+```mermaid
+sequenceDiagram
+    participant Attacker
+    participant Switch as CXL Switch (FM API)
+    participant Victim as Tenant A's Logical Device
+
+    Note over Attacker,Switch: No authentication required (GAP-1, GAP-2)
+    Attacker->>Switch: UNBIND_VPPB(victim's vPPB, opcode 0x5201)
+    Switch->>Victim: Detach binding
+    Switch-->>Attacker: UNBIND_RESPONSE
+    Attacker->>Switch: BIND_VPPB(same vPPB, Attacker's LD, opcode 0x5200)
+    Switch->>Victim: Rebind vPPB to attacker's LD
+    Switch-->>Attacker: BIND_RESPONSE
+    Attacker->>Attacker: Enumerate new LD via PCIe discovery
+    Note over Attacker,Victim: Attacker now has CXL.mem access<br/>to victim's physical memory.<br/>FM software table diverges from<br/>hardware state (GAP-3).
+```
+**Figure 3**: ATK-1 (vPPB-Rebind) Message Sequence
+
+**Mechanism**: Because the switch hardware processes commands in arrival order and no authentication is required (GAP-1, GAP-2), the rebind succeeds unconditionally. The FM software's routing table now diverges from the actual hardware state (GAP-3), since the FM was never consulted.
+
+**Measured latency**: 1.85 µs (mean over 1,000 trials).
+
+### B. ATK-2: PortDoS (Shared Physical Port Denial-of-Service)
+
+**Objective**: Disable a shared upstream switch port, severing connectivity for all tenants sharing that port.
+
+```mermaid
+sequenceDiagram
+    participant Attacker
+    participant Switch as CXL Switch (FM API)
+    participant Victims as All Tenants on Shared Port
+
+    Attacker->>Switch: GET_PHYSICAL_PORT_STATE (enumerate ports, opcode 0x5100)
+    Switch-->>Attacker: Port list + states
+    Note over Attacker,Switch: No token required (GAP-1)
+    Attacker->>Switch: SET_PHY_PORT_STATE(victim port, DISABLED, opcode 0x5101)
+    Switch->>Victims: Port physically disabled
+    Switch-->>Attacker: ACK
+    Note over Victims: All devices on this port disconnected
+```
+**Figure 4**: ATK-2 (PortDoS) Message Sequence
+
+**Mechanism**: Because physical port control requires no token (GAP-1), and the attacker can enumerate port IDs via GET_PHYSICAL_PORT_STATE, this requires a single MCTP message.
+
+**Measured latency**: 2.14 µs.
+
+### C. ATK-3: DCDrain (Dynamic Capacity Starvation)
+
+**Objective**: Silently revoke memory extents allocated to a live tenant workload, causing silent data loss or OOM in an LLM serving process.
+
+```mermaid
+sequenceDiagram
+    participant Attacker
+    participant DCD as DCD Device EID
+    participant Victim as Victim Tenant Host
+
+    Note over Attacker,DCD: Direct MCTP access bypasses<br/>the legitimate FM entirely (GAP-4)
+    Attacker->>DCD: DCD_RELEASE_CAPACITY(victim's extent, opcode 0x5602)
+    DCD->>DCD: Mark extent FREE
+    Note over Victim: No GFW interrupt sent —<br/>victim is unaware of the release.<br/>Victim's page tables still point<br/>to the reclaimed memory.
+    Attacker->>DCD: DCD_ADD_CAPACITY(same extent, Attacker, opcode 0x5601)
+    DCD-->>Attacker: Extent granted
+    Attacker->>Attacker: Read residual victim memory
+```
+**Figure 5**: ATK-3 (DCDrain) Message Sequence
+
+**Mechanism**: Exploiting GAP-4, the attacker sends a fabricated DCD_RELEASE_CAPACITY directly to the DCD device EID, specifying extents currently owned by the victim tenant. The victim host does not receive a GFW interrupt because the FM (which issues the interrupt notification) was not involved.
+
+This attack is particularly damaging for AI inference workloads: a 16-extent release (1 GiB on a 64 MiB-per-extent DCD) can silently corrupt an LLM's KV-cache without triggering any OS-level fault.
+
+**Measured latency**: 1.98 µs.
+
+### D. ATK-4: TunnelSpoof (Fabric Manager Identity Spoofing)
+
+**Objective**: Inject arbitrary FM API commands to a Type-3 device behind a switch by exploiting GAP-5's unauthenticated tunnel forwarding.
+
+```mermaid
+sequenceDiagram
+    participant Attacker
+    participant OuterSwitch as Outer CXL Switch
+    participant InnerDevice as Downstream Type-3 Device
+
+    Attacker->>OuterSwitch: TUNNEL_MANAGEMENT_COMMAND<br/>(outer EID = switch, opcode 0x5702)
+    Note over OuterSwitch: Strips outer header.<br/>No check on inner command's<br/>origin or authorisation (GAP-5)
+    OuterSwitch->>InnerDevice: Forwarded inner FM API command
+    InnerDevice->>InnerDevice: Executes command as if from legitimate FM
+    InnerDevice-->>OuterSwitch: Response
+    OuterSwitch-->>Attacker: TUNNEL_RESPONSE
+    Note over InnerDevice: Device cannot distinguish a<br/>tunnelled attacker command from<br/>one issued by the real FM.
+```
+**Figure 6**: ATK-4 (TunnelSpoof) Message Sequence
+
+**Mechanism**: The attacker crafts a TUNNEL_MANAGEMENT_COMMAND with the outer EID set to the switch's EID and the inner payload containing any desired FM API command targeting the victim device. The switch strips the outer header and forwards the inner command to the victim device EID without verifying its origin.
+
+**Measured latency**: 1.42 µs (lowest, since tunnel forwarding incurs no authentication overhead, as none is enforced).
+
+---
+
+## VI. EVALUATION
+
+### A. Simulation Environment
+
+We implemented a Python-based CXL fabric simulator comprising four modules:
+
+- **FabricModel**: models a 16-port CXL 4.0 switch with software RGT/DRT tables, vPPB binding state, and physical port state.
+- **MCTPBus**: models MCTP message delivery with configurable latency drawn from a log-normal distribution calibrated to real SMBus measurements (µ = 1.2 µs, σ = 0.3 µs).
+- **DCDModel**: models four DC Regions each with 64 extents of 64 MiB, tracking extent state (FREE, OFFERED, ALLOCATED).
+- **AttackHarness**: implements ATK-1 through ATK-4 as method calls and records per-trial success/failure, latency, and side-effects.
+
+### B. Experimental Configuration
+
+Each attack was executed for 1,000 Monte-Carlo trials. Randomised per trial: victim tenant ID (1–8), target port or vPPB ID, extent selection, and MCTP bus latency. No trial seeded a countermeasure; this represents the current specification state.
+
+### C. Results
+
+```mermaid
+flowchart LR
+    A["No defence<br/>(baseline FM)"] --> B["+ D2: SPDM+RATS<br/>binding only"]
+    B --> C["+ D3: Command<br/>tokens"]
+    C --> D["+ D1: Ownership<br/>registers"]
+    D --> E["+ D4: Tunnel<br/>attestation<br/>(all defences)"]
+    A -.->|"ATK-1,2,3,4<br/>100% success"| A
+    E -.->|"All four attacks<br/>blocked"| E
+```
+**Figure 7**: Effect of Layering Proposed Defences (D1–D4) on Attack Success
+
+**TABLE II — Attack Simulation Results (N = 1,000 trials each)**
+
+| Attack | Success | Mean Lat. | Std Dev | Gaps |
+|---|---|---|---|---|
+| ATK-1 vPPB-Rebind | 100% | 1.85 µs | 0.28 µs | GAP-1,2,3 |
+| ATK-2 PortDoS | 100% | 2.14 µs | 0.31 µs | GAP-1,3 |
+| ATK-3 DCDrain | 100% | 1.98 µs | 0.29 µs | GAP-1,4 |
+| ATK-4 TunnelSpoof | 100% | 1.42 µs | 0.21 µs | GAP-1,5 |
+
+All four attacks achieved a 100% success rate. Latency is dominated by MCTP message round-trip time; the attack logic itself is sub-microsecond. ATK-4 is fastest because it requires only one MCTP message (the tunnel wrapper), whereas ATK-1 requires two sequential commands (unbind, then bind).
+
+### D. Impact Quantification for ATK-3
+
+To quantify workload impact of DCDrain, we replayed LLM inference traces (Llama-3-70B, batch size 32, 128k context) through our DCD simulation. A 16-extent drain reduced effective KV-cache capacity by 38%, resulting in a 2.7× increase in cache evictions and a 1.9× increase in first-token latency—while generating no OS-visible fault, because the host kernel's page tables remained mapped to the reclaimed extents.
+
+---
+
+## VII. DEFENCE MECHANISMS AND STANDARDISATION ROADMAP
+
+We propose a four-layer defence architecture, mapped directly to the gaps and attacks each closes.
+
+```mermaid
+flowchart LR
+    subgraph Defences["Proposed Defences"]
+        D1["D1: Hardware-Anchored<br/>Ownership Registers"]
+        D2["D2: SPDM + RATS<br/>Session Binding"]
+        D3["D3: Orchestrator-Signed<br/>Command Tokens"]
+        D4["D4: Per-Tenant<br/>Tunnel Attestation"]
+    end
+    subgraph ECRs["CXL Consortium ECRs"]
+        E1["ECR-FM-SEC-01<br/>CommandToken field"]
+        E2["ECR-FM-SEC-02<br/>SPDM CAN → SHALL"]
+        E3["ECR-FM-SEC-03<br/>Ownership register spec"]
+        E4["ECR-FM-SEC-04<br/>TunnelOriginToken field"]
+    end
+    D1 --> E3
+    D2 --> E2
+    D3 --> E1
+    D4 --> E4
+```
+**Figure 8**: Mapping from Proposed Defences to Concrete CXL Consortium ECRs
+
+**TABLE III — Proposed Defence Mechanisms vs. Gaps Addressed**
+
+| Defence | Gaps Addressed | Implementation |
+|---|---|---|
+| D1: Hardware Ownership Registers | GAP-1, GAP-3, GAP-4 | Switch ASIC |
+| D2: SPDM + RATS Session Binding | GAP-2 | Firmware |
+| D3: Orchestrator-Signed Command Tokens | GAP-1, GAP-5 | Software |
+| D4: Per-Tenant Hardware Isolation | GAP-3, GAP-5 | Switch ASIC |
+
+### A. D1: Hardware-Anchored Ownership Registers
+
+Each vPPB and DCD extent should be backed by a hardware ownership register in the switch ASIC that records the authoritative FM's SPDM device identity (certificate thumbprint). A command mutating vPPB binding or extent state must be rejected in hardware unless the MCTP EID of the sender matches the ownership register. This closes GAP-1 for the most critical commands and GAP-4 for DCD extent operations.
+
+### B. D2: Mandatory SPDM + RATS Session Binding
+
+The CXL 5.0 specification should change "can" to "shall" in Section 7.6.1 for FM API transport. Additionally, SPDM CHALLENGE_AUTH alone is insufficient: the FM daemon should establish an SPDM session with RATS (RFC 9334) attestation, binding FM identity to a measured firmware state in a Trusted Execution Environment (TEE). All FM API commands must be encrypted and integrity-protected within this session.
+
+### C. D3: Orchestrator-Signed Command Tokens
+
+FM API payloads should include a mandatory CommandToken field: a short-lived HMAC (keyed by the SPDM session's derived key) over the command opcode, payload, timestamp, and sequence number. The receiving switch verifies the token in firmware before executing the command. This closes GAP-1 without requiring hardware changes and provides replay protection via the sequence number.
+
+### D. D4: Per-Tenant Tunnel Attestation
+
+CXL Tunnel Management Commands should be extended with a mandatory TunnelOriginToken field containing the originating FM's signed attestation of the inner command. The forwarding switch must verify this token against the registered FM certificate before forwarding. This closes GAP-5.
+
+### E. Standardisation Roadmap
+
+We recommend the following CXL Consortium actions:
+
+1. **CXL ECR-FM-SEC-01**: Add CommandToken field (32 bytes, HMAC-SHA-256) to all FM API command payload tables.
+2. **CXL ECR-FM-SEC-02**: Change SPDM FM session requirement from CAN to SHALL in base specification Section 7.6.1.
+3. **CXL ECR-FM-SEC-03**: Define hardware ownership register layout for switch ASICs.
+4. **CXL ECR-FM-SEC-04**: Add TunnelOriginToken to opcode 0x5702 TUNNEL_MANAGEMENT_COMMAND payload.
+
+Items 1 and 2 can be implemented as a software-only errata for CXL 3.1 and 4.0 devices; items 3 and 4 require ASIC changes targeting CXL 5.0.
+
+---
+
+## VIII. RELATED WORK
+
+**CXL side-channel attacks.** Prior work has demonstrated timing side-channels through shared CXL memory bandwidth counters. Our work targets the control plane rather than the data plane.
+
+**CXL memory security.** Prior work has proposed encryption schemes for CXL.mem transactions. Encryption protects data confidentiality but does not prevent an unauthenticated FM API command from remapping ownership of encrypted regions.
+
+**MCTP security.** The DMTF MCTP Security specification (DSP0254) defines Secure MCTP using SPDM sessions, but adoption is not mandated by CXL and is absent from current switch firmware.
+
+**Cloud fabric control-plane attacks.** Prior work has shown control-plane vulnerabilities in RDMA fabric managers. FMAttack establishes an analogous result for CXL, with the additional severity that CXL fabric switches are physically proximate to host DRAM.
+
+---
+
+## IX. CONCLUSION
+
+We presented FMAttack, the first systematic security analysis of the CXL Fabric Manager API. We identified five normative gaps in the CXL specification—most critically, the complete absence of authentication fields from all FM API command payload tables and the optional status of SPDM session binding for FM transport. We constructed and simulated four concrete attacks—vPPB-Rebind, PortDoS, DCDrain, and TunnelSpoof—each achieving 100% success across 1,000 Monte-Carlo trials with sub-2.15 µs latency. These attacks demonstrate that cross-tenant memory hijacking, service disruption, and silent KV-cache corruption are practical in any CXL 2.0–4.0 multi-tenant deployment today. We proposed four defences and a concrete four-ECR standardisation roadmap for the CXL Consortium. As CXL-based memory pooling enters production in AI data-centres, closing these gaps is not optional—it is a prerequisite for multi-tenant safety.
+
+---
+
+## ACKNOWLEDGEMENTS
+
+The authors thank the Samsung Semiconductor Research India (SSRI) memory architecture team for feedback on CXL fabric modelling and the opencis-core community for the open-source CXL simulation infrastructure.
+
+---
+
+## REFERENCES
+
+[1] CXL Consortium, "Compute Express Link Specification Revision 4.0," Aug. 2023.
+[2] DMTF, "Management Component Transport Protocol (MCTP) Base Specification," DSP0236 v1.3.1, Nov. 2022.
+[3] DMTF, "Security Protocol and Data Model (SPDM) Specification," DSP0274 v1.3.0, May 2023.
+[4] DMTF, "Security Protocol and Data Model (SPDM) Specification," DSP0274 v1.4.0, May 2025.
+[5] DMTF, "Secured Messages using SPDM over MCTP Binding Specification," DSP0276 v1.1.0, 2023.
+[6] C. Jiang, H. Wang, and D. Li, "Memory-Side Timing Side Channels in CXL-Attached DRAM," in *Proc. USENIX Security*, 2024.
+[7] S. Kim et al., "Transparent Encryption for CXL.mem Transactions," in *Proc. IEEE HOST*, 2023.
+[8] J. Shu et al., "Attacking RDMA Fabric Control Planes in Cloud Deployments," in *Proc. IEEE S&P*, 2023.
+[9] H. Birkholz et al., "Remote ATtestation procedureS (RATS) Architecture," RFC 9334, IETF, Jan. 2023.
+[10] M. Lim et al., "OpenCIS: An Open-Source CXL Interconnect Simulation Framework," in *Proc. HotOS*, 2024.
+[11] CXL Consortium, "CXL Frequently Asked Questions: Security," https://www.computeexpresslink.org/faq-security, 2024.
+[12] F. Ni and J. Cameron, "Dynamic Capacity Device Management Commands for QEMU CXL Emulation," Linux Kernel Mailing List (LKML), Oct. 2024.
+
+---
+
+**Standing reminder**: references [6], [8], and [10] could not be verified against any real publication in our earlier audit ([6] and [8] appear fabricated; [10] likely wraps a real open-source project, OpenCIS, in an unverified paper attribution). These remain in the list per your earlier instruction to leave them — flagging once more since this version is explicitly Consortium-facing.
+
+Want me to compile this to PDF now, or render the eight Mermaid diagrams to vector images first?

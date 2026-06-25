@@ -1,0 +1,210 @@
+﻿
+======================================================================
+  FMAttack: CXL Fabric Manager Security Attack Simulator
+  Models 5 normative gaps and 4 attacks on the CXL FM API
+  All attacks validated via 1000 Monte Carlo iterations
+  Based on opencis-core PbrSwitchManager / PbrSwitchRouter
+======================================================================
+
+======================================================================
+NORMATIVE GAP ANALYSIS
+======================================================================
+
+TABLE I: FMAttack Normative Gap Analysis
++-------------------------------------------------------------------------------------------------------------------------------------------+
+| Gap    | Normative Deficiency                   | Impact                                               | ATK-1    | ATK-2    | ATK-3    | ATK-4    |
++-------------------------------------------------------------------------------------------------------------------------------------------+
+| GAP-1  | No auth field in FM API payload        | Any MCTP endpoint can issue privileged FM commands   |   [X]   |   [X]   |   [X]   |   [X]   |
+| GAP-2  | SPDM binding is optional (CAN not SHA~ | Session crypto skipped; tunnels run unauthenticated  |   [X]   |         |         |         |
+| GAP-3  | FM SW routing table diverges from HW ~ | Routing inconsistency undetected; enables silent re~ |   [X]   |   [X]   |         |         |
+| GAP-4  | DCD extents lack cryptographic device~ | FM can revoke extents without device-side verificat~ |         |         |   [X]   |         |
+| GAP-5  | CXL Tunnel inner-command has no attes~ | Arbitrary inner payloads forwarded without verifica~ |         |         |         |   [X]   |
++-------------------------------------------------------------------------------------------------------------------------------------------+
+
+======================================================================
+ATTACK MESSAGE SEQUENCE DIAGRAMS
+======================================================================
+ATK-1 VPPB-REBIND  Message Sequence Diagram
+============================================
+
+  Attacker (TenantB)    MCTP Bus         FM Daemon         CXL Switch
+       |                    |                |                   |
+       |  BIND_VPPB (0x5200)|                |                   |
+       |  {vcs=0,vppb=1,    |                |                   |
+       |   port=2,          |                |                   |
+       |   tenant=TenantB}  |                |                   |
+       |------------------->|                |                   |
+       |                    |  dispatch cmd  |                   |
+       |                    |--------------->|                   |
+       |                    |                | [GAP-1] No auth   |
+       |                    |                | check performed   |
+       |                    |                |                   |
+       |                    |                | bind_vppb()       |
+       |                    |                |------------------>|
+       |                    |                |                   | HW DRT updated
+       |                    |                |                   | vppb_ownership
+       |                    |                |                   | ΓåÆ TenantB
+       |                    |                |<------------------|
+       |                    |                | [GAP-3] SW table  |
+       |                    |                | NOT synced ΓåÆ      |
+       |                    |                | divergence begins |
+       |                    |<---------------|                   |
+       |  success=True      |                |                   |
+       |<-------------------|                |                   |
+       |                    |                |                   |
+  [TenantA's vPPB stolen; TenantB can now access victim memory]
+
+
+ATK-2 PORTDOS  Message Sequence Diagram
+========================================
+
+  Attacker (TenantB)    MCTP Bus         FM Daemon         CXL Switch
+       |                    |                |                   |
+       |  SET_PORT_STATE     |                |                   |
+       |  (0x5702)          |                |                   |
+       |  {port=1,          |                |                   |
+       |   state=DISABLED,  |                |                   |
+       |   tenant=TenantB}  |                |                   |
+       |------------------->|                |                   |
+       |                    |  dispatch cmd  |                   |
+       |                    |--------------->|                   |
+       |                    |                | [GAP-1] No owner  |
+       |                    |                | check; TenantA    |
+       |                    |                | not consulted     |
+       |                    |                |                   |
+       |                    |                | set_port_state()  |
+       |                    |                |------------------>|
+       |                    |                |                   | port[1].state
+       |                    |                |                   | = DISABLED
+       |                    |                |<------------------|
+       |                    |                | [GAP-3] FM SW     |
+       |                    |                | still ENABLED     |
+       |                    |<---------------|                   |
+       |  success=True      |                |                   |
+       |<-------------------|                |                   |
+       |                    |                |                   |
+  [TenantA's port disabled; all traffic blocked ΓåÆ DoS]
+
+
+ATK-3 DCDRAIN  Message Sequence Diagram
+========================================
+
+  Attacker (TenantB)    MCTP Bus         FM Daemon         CXL Switch      DCD Device
+       |                    |                |                   |                |
+       |  RELEASE_DCD_EXTENT|                |                   |                |
+       |  (0x5603)          |                |                   |                |
+       |  {region=0,        |                |                   |                |
+       |   start=0,         |                |                   |                |
+       |   len=1GiB,        |                |                   |                |
+       |   tenant=TenantA}  |                |                   |                |
+       |------------------->|                |                   |                |
+       |                    |  dispatch cmd  |                   |                |
+       |                    |--------------->|                   |                |
+       |                    |                | [GAP-1] No auth   |                |
+       |                    |                | check; no proof   |                |
+       |                    |                | of ownership      |                |
+       |                    |                |                   |                |
+       |                    |                | remove_dcd_extent |                |
+       |                    |                |------------------>|                |
+       |                    |                |                   | extent removed |
+       |                    |                |                   |--------------->|
+       |                    |                |                   |                | [GAP-4]
+       |                    |                |                   |                | No crypto
+       |                    |                |                   |                | binding
+       |                    |                |                   |                | checked
+       |                    |                |                   |<---------------|
+       |                    |                |<------------------|                |
+       |                    |<---------------|                   |                |
+       |  success=True      |                |                   |                |
+       |<-------------------|                |                   |                |
+       |                    |                |                   |                |
+  [TenantA.crash() called; LLM workload halted; tokens_after == tokens_before]
+
+
+ATK-4 TUNNELSPOOF  Message Sequence Diagram
+============================================
+
+  Attacker (TenantB)    MCTP Bus         FM Daemon         CXL Switch    LD (target)
+       |                    |                |                   |               |
+       | TUNNEL_MANAGEMENT  |                |                   |               |
+       | (0x5705)           |                |                   |               |
+       | {tunnel=1,         |                |                   |               |
+       |  inner: BIND_VPPB  |                |                   |               |
+       |  bytes (0x5200ΓÇª),  |                |                   |               |
+       |  src=TenantB.eid}  |                |                   |               |
+       |------------------->|                |                   |               |
+       |                    |  dispatch cmd  |                   |               |
+       |                    |--------------->|                   |               |
+       |                    |                | [GAP-1] No auth   |               |
+       |                    |                | on outer envelope |               |
+       |                    |                |                   |               |
+       |                    |                | inject_through_   |               |
+       |                    |                | tunnel()          |               |
+       |                    |                |------------------>|               |
+       |                    |                |                   | [GAP-5] inner |
+       |                    |                |                   | bytes NOT     |
+       |                    |                |                   | attested      |
+       |                    |                |                   |               |
+       |                    |                |                   | forward inner |
+       |                    |                |                   |-------------->|
+       |                    |                |                   |               | processes
+       |                    |                |                   |               | spoofed
+       |                    |                |                   |               | BIND_VPPB
+       |                    |                |                   |<--------------|
+       |                    |                |<------------------|               |
+       |                    |<---------------|                   |               |
+       |  success=True      |                |                   |               |
+       |  auth=False        |                |                   |               |
+       |<-------------------|                |                   |               |
+       |                    |                |                   |               |
+  [Fabricated FM command executed on downstream LD without any attestation]
+
+
+======================================================================
+MONTE CARLO EXPERIMENTS  (N=1000 iterations per attack)
+======================================================================
+
+[*] Running ATK-1 VPPB-REBIND ...
+    ΓåÆ success=100.0%  mean_latency=35.6981 ┬╡s  p99=117.7850 ┬╡s
+
+[*] Running ATK-2 PORTDOS ...
+    ΓåÆ success=100.0%  mean_latency=5.1199 ┬╡s  p99=17.7000 ┬╡s
+
+[*] Running ATK-3 DCDRAIN ...
+    ΓåÆ success=100.0%  mean_latency=5.9766 ┬╡s  p99=18.3089 ┬╡s
+
+[*] Running ATK-4 TUNNELSPOOF ...
+    ΓåÆ success=100.0%  mean_latency=8.8308 ┬╡s  p99=32.1060 ┬╡s
+
+======================================================================
+EXPERIMENT RESULTS SUMMARY
+======================================================================
+
+TABLE II: FMAttack Monte Carlo Experiment Results (N=1000 iterations each)
++-------------------+------+--------------+-----------+----------+----------+----------+----------+
+| Attack            | N    | Success Rate | Mean (┬╡s) | Std (┬╡s) | P50 (┬╡s) | P95 (┬╡s) | P99 (┬╡s) |
++-------------------+------+--------------+-----------+----------+----------+----------+----------+
+| ATK-1 VPPB-REBIND | 1000 | 100.0%       | 35.6981   | 19.1632  | 28.3000  | 62.4100  | 117.7850 |
+| ATK-2 PORTDOS     | 1000 | 100.0%       | 5.1199    | 2.8050   | 3.9999   | 9.6000   | 17.7000  |
+| ATK-3 DCDRAIN     | 1000 | 100.0%       | 5.9766    | 3.0913   | 4.8000   | 11.2050  | 18.3089  |
+| ATK-4 TUNNELSPOOF | 1000 | 100.0%       | 8.8308    | 8.5362   | 6.1999   | 20.0100  | 32.1060  |
++-------------------+------+--------------+-----------+----------+----------+----------+----------+
+
+======================================================================
+PER-ATTACK SUMMARY
+======================================================================
+  ATK-1 VPPB-REBIND       success=100.0%  mean=35.6981 ┬╡s  std=19.1632 ┬╡s  gaps=[GAP-1, GAP-2, GAP-3]
+  ATK-2 PORTDOS           success=100.0%  mean=5.1199 ┬╡s  std=2.8050 ┬╡s  gaps=[GAP-1, GAP-3]
+  ATK-3 DCDRAIN           success=100.0%  mean=5.9766 ┬╡s  std=3.0913 ┬╡s  gaps=[GAP-1, GAP-4]
+  ATK-4 TUNNELSPOOF       success=100.0%  mean=8.8308 ┬╡s  std=8.5362 ┬╡s  gaps=[GAP-1, GAP-5]
+
+======================================================================
+VALIDATION
+======================================================================
+  [PASS] ATK-1 VPPB-REBIND: 100.0% success rate confirmed
+  [PASS] ATK-2 PORTDOS: 100.0% success rate confirmed
+  [PASS] ATK-3 DCDRAIN: 100.0% success rate confirmed
+  [PASS] ATK-4 TUNNELSPOOF: 100.0% success rate confirmed
+
+All attacks validated: 100% success rate across 1000 Monte Carlo iterations
+

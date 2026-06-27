@@ -1,0 +1,75 @@
+
+
+***
+
+# FMAttack: Exploiting Availability and Isolation Gaps in the CXL Fabric Manager API for Data Destruction and DoS
+
+**M.N. Srivatsa Bharadwaj**
+Samsung Semiconductor Research India (SSRI), Bengaluru, Karnataka, India
+
+## Abstract
+Compute Express Link (CXL) 4.0 defines a Fabric Manager (FM) API for orchestrating multi-tenant memory pools, dynamic capacity regions, and port-based routing across disaggregated CXL fabrics. While the CXL Trusted Execution Environment Security Protocol (TSP) successfully utilizes hardware configuration locking and data sanitization to guarantee data *confidentiality*, the specification explicitly accepts Denial of Service (DoS) as out of scope. We identify three severe architectural loopholes where this prioritization of confidentiality over availability can be weaponized by a compromised control plane. Exploiting these gaps, we construct four concrete attacks: The Forced Unbind DoS (ATK-1), Architecturally Sanctioned Port DoS (ATK-2), Forced Removal Data Destruction (ATK-3), and the LD Pool CCI Pivot (ATK-4). These attacks allow a compromised FM or tenant to instantly destroy live LLM KV-cache memory, sever shared physical interconnects, and bypass Multi-Headed device isolation. To address these fundamental availability gaps, we propose a High-Availability and Blast-Radius Containment Architecture for CXL 5.0, introducing Quorum-Based FM Authorization, Hardware-Enforced Host Vetoes, and Out-of-Band (OOB) Air-Gapping for global management interfaces.
+
+---
+
+## I. INTRODUCTION
+Compute Express Link (CXL) has emerged as the dominant interconnect standard for memory disaggregation. The FM API is the control plane for every multi-tenant CXL fabric, responsible for allocating memory regions and managing physical ports. 
+
+Recent additions to the CXL specification, specifically the CXL Trusted Execution Environment Security Protocol (TSP), have fortified the architecture against data theft by mandating SPDM authentication, `CONFIG_LOCKED` hardware states, and mandatory cryptographic data sanitization during capacity reallocation. However, this robust defense of *confidentiality* has created a blind spot regarding *availability*. The CXL 4.0 security model explicitly states: "Denial of service attacks are beyond the scope of this specification." 
+
+We demonstrate that a compromised Fabric Manager—or a tenant exploiting tunneling features—can weaponize CXL's own security features to permanently destroy multi-tenant data and expand blast radiuses across isolated physical heads.
+
+---
+
+## II. NORMATIVE GAP ANALYSIS
+
+We identified three normative gaps in the CXL 4.0 specification that expose multi-tenant fabrics to devastating availability and isolation failures.
+
+**GAP-1: Single-Authority Trust Model without Quorum**
+CXL places absolute trust in the primary registered Fabric Manager. Once a secure session is established, the switch and endpoints blindly execute destructive commands (such as physical port disablement) from this single entity without requiring secondary cryptographic authorization or a quorum of orchestrators.
+
+**GAP-2: Forced Removal Data Destruction without Host Veto**
+When the FM reallocates Dynamic Capacity Device (DCD) extents using the "Forced Removal" flag, the device instantly revokes host access. To prevent data leakage, the TSP mandates immediate cryptographic scrambling of the capacity. The specification provides no grace period or veto mechanism for the victim host to save its data to persistent storage before destruction.
+
+**GAP-3: In-band Tunneling to Global LD Pool CCIs**
+CXL 4.0 mandates that Multi-Headed Devices (MH-MLD) expose an LD Pool CCI to manage all logical devices across the entire hardware. The specification permits local heads to access this global interface using the `Tunnel Management Command` (Opcode 0x5300), but provides no strict architectural mandate for air-gapping this interface from tenant-accessible PCIe paths.
+
+---
+
+## III. ATTACK DESIGN
+
+### A. ATK-1: The Forced Unbind DoS & Device Takeover
+**Objective:** Sever a victim tenant's connection and gain internal CXL.io access to the endpoint.
+**Mechanism:** CXL switches block the FM from using tunneled CXL.io requests to read/write memory on a port actively bound to a host. To bypass this, the attacker issues an `Unbind vPPB` command to the switch. When unbound, the port becomes FM-owned, and the switch drops its blocking protections. While TSP prevents the attacker from reading the victim's data, the unbind acts as an unblockable Surprise Removal (DoS) for the host and grants the attacker full internal access to the device registers.
+
+### B. ATK-2: Architecturally Sanctioned Port DoS
+**Objective:** Disable a shared upstream switch port, severing connectivity for all tenants sharing that port.
+**Mechanism:** Exploiting GAP-1 and the explicit acknowledgment that DoS is out of scope, a compromised FM issues the `Set Physical Port State` command to disable a shared switch port. Because there is no quorum requirement for availability-impacting commands, a single compromised daemon can instantly take down entire multi-tenant switch topologies.
+
+### C. ATK-3: Forced Removal Data Destruction (DCDrain)
+**Objective:** Leverage hardware sanitization to instantly destroy a victim's memory.
+**Mechanism:** Exploiting GAP-2, the attacker issues `Initiate Dynamic Capacity Release` (Opcode 0x5605) directly to the DCD, targeting the victim's extents, and sets the **Forced Removal** flag (Bit 4) to 1. The device bypasses the host acknowledgment handshake and instantly revokes access. To fulfill TSP confidentiality requirements, the hardware automatically overwrites or scrambles the data (Sanitize on Release). The attacker uses the device's own security mechanisms to permanently destroy the victim's data (e.g., an LLM KV-Cache) without the host OS receiving a warning interrupt.
+
+### D. ATK-4: The LD Pool CCI Pivot (TunnelSpoof)
+**Objective:** Pivot from a single isolated physical Head to gain global management over all tenants on a Multi-Headed Device.
+**Mechanism:** Exploiting GAP-3, an attacker who has compromised a tenant host (e.g., Head 0) issues the `Tunnel Management Command` to its local mailbox, setting the `Target Type` field to `1h` (LD Pool CCI). The local head forwards the encapsulated command to the global LD Pool CCI. Because this global interface manages all logical devices across all heads, the attacker can now disrupt memory configurations for completely different tenants on isolated physical heads.
+
+---
+
+## IV. PROPOSED CXL 5.0 DEFENSES
+
+To address these fundamental architectural vulnerabilities, we propose a High-Availability and Blast-Radius Containment Architecture.
+
+**D1: Quorum-Based FM Authorization (Mitigates ATK-1 & ATK-2)**
+We propose an extension to the SPDM binding that requires cryptographic Multi-Signature (Quorum) Authorization for any destructive or availability-impacting FM API commands (e.g., `Unbind vPPB`, `Set Physical Port State`). Switches must require signed tokens from a quorum of orchestrator nodes before executing these commands, neutralizing the single-point-of-failure in the current control plane.
+
+**D2: Hardware-Enforced Host Veto & Grace Periods (Mitigates ATK-3)**
+We propose updating the DCD state machine to introduce a hardware-enforced Grace Period. When a device receives a Forced Removal command, rather than instantly destroying the data, it must initiate a programmable countdown and alert the host. The host may either flush its data to persistent storage, or, if the removal is malicious, issue a "Veto" command via CXL.io to lock the extent. This shifts ultimate availability authority from the remote FM to the local tenant.
+
+**D3: Out-of-Band (OOB) Air-Gapping for Global CCIs (Mitigates ATK-4)**
+We propose standardizing a strict Asymmetric CCI Privilege Architecture that physically air-gaps the LD Pool CCI. Under this defense, the global LD Pool CCI can *only* be accessed via an Out-of-Band transport (e.g., a dedicated physical I2C/I3C network), and the routing of `Tunnel Management Commands` from in-band tenant PCIe links to the global CCI is explicitly prohibited in hardware, eliminating the MH-MLD pivot loophole entirely.
+
+---
+
+## V. CONCLUSION
+While CXL 4.0 successfully guarantees data confidentiality via the TSP, its acceptance of Denial of Service as an out-of-scope threat leaves the control plane highly vulnerable. Our attacks demonstrate that a compromised Fabric Manager can weaponize existing CXL commands to forcefully unbind tenants, permanently destroy data via forced hardware sanitization, and pivot across isolated physical heads. By implementing Quorum-Based Authorization, Host Vetoes, and OOB Air-Gapping, future CXL specifications can elevate multi-tenant availability to the same tier of protection as confidentiality.

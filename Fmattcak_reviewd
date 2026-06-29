@@ -1,0 +1,174 @@
+# FMAttack: Exploiting Authentication Gaps in the CXL Fabric Manager API for Data Destruction and Denial of Service
+
+**M.N. Srivatsa Bharadwaj**
+Samsung Semiconductor Research India (SSRI), Bengaluru, Karnataka, India
+
+***
+
+## Abstract
+Compute Express Link (CXL) 4.0 defines a Fabric Manager (FM) API for orchestrating multi-tenant memory pools, dynamic capacity regions, and port-based routing across disaggregated CXL fabrics [1]. While the CXL Trusted Execution Environment Security Protocol (TSP) successfully utilizes hardware configuration locking and data sanitization to guarantee data confidentiality (CXL 4.0 Spec, Section 11.5.4.8.1), the specification explicitly accepts Denial of Service (DoS) as out of scope [1]. Furthermore, the CXL specification allows SPDM session binding for FM commands to be optional (CXL 4.0 Spec, Section 7.6.3), leaving the management transport exposed [1]. We identify five normative gaps in the CXL specification: the FM API command payload tables contain no authentication fields, SPDM session binding is not strictly mandated, and the software routing table maintained by the FM can diverge silently from the hardware routing table in the CXL switch [1]. Exploiting these gaps under an unauthenticated network attacker threat model, we construct four concrete attacks: VPPB-REBIND (ATK-1), PORTDOS (ATK-2), DCDRAIN (ATK-3), and TUNNELSPOOF (ATK-4). These attacks allow an unauthenticated attacker to permanently destroy multi-tenant data via hardware sanitization mechanisms and sever shared physical interconnects [1]. We propose four complementary hardware and software defenses—hardware-anchored ownership registers, SPDM + RATS attestation binding, orchestrator-signed command tokens, and per-tenant hardware isolation—to secure the control plane for CXL 5.0 [2].
+
+**Index Terms**—CXL, Fabric Manager, FMAPI, MCTP, SPDM, multi-tenant, disaggregated memory, dynamic capacity device, denial of service.
+
+***
+
+## I. INTRODUCTION
+Compute Express Link (CXL) has emerged as the dominant interconnect standard for memory disaggregation in hyperscale data-centers. CXL 4.0 refined Dynamic Capacity Devices (DCD), Port-Based Routing (PBR), and the Fabric Manager (FM) API that orchestrates all of these components [1]. The FM API is the control plane for every multi-tenant CXL fabric, serving as the sole mechanism through which memory regions are allocated across tenants and virtual PCI-to-PCI bridges (vPPBs) are bound to logical devices (CXL 4.0 Spec, Section 7.6.1) [1]. 
+
+Recent additions to the CXL specification, specifically the CXL Trusted Execution Environment Security Protocol (TSP), have fortified the architecture against data theft by mandating SPDM authentication and `CONFIG_LOCKED` hardware states for confidential computing (CXL 4.0 Spec, Section 11.5) [1]. However, this robust defense of *confidentiality* has created a blind spot regarding *availability*. The CXL security model explicitly states: "Denial of service attacks are beyond the scope of this specification" (CXL 4.0 Spec) [1]. 
+
+Compounding this availability gap is the permissive language regarding management bus security. The CXL specification states that the FM API *may* be transported inside an SPDM session (CXL 4.0 Spec, Section 7.6.3), making cryptographic transport security optional rather than mandatory [1]. We demonstrate that an unauthenticated network attacker on the Management Component Transport Protocol (MCTP) bus can weaponize CXL's own security features to permanently destroy multi-tenant data and expand blast radiuses across isolated physical heads.
+
+We make the following contributions:
+1.  We perform a systematic security audit of the CXL FM API command set and identify five normative specification gaps (GAP-1 through GAP-5) that leave FM command authentication undefined by the CXL standard [1], [2].
+2.  We demonstrate that the MCTP transport used by the FM API allows any unauthenticated process on the network to issue FM commands directly to a CXL switch, bypassing the legitimate FM software entirely [2].
+3.  We construct four end-to-end attacks (ATK-1 through ATK-4) that exploit these gaps to achieve unblockable denial-of-service, forced-removal data destruction, and command injection [1], [2].
+4.  We propose a four-layer defense architecture and a concrete standardization roadmap to elevate FM authentication from an optional feature to a mandatory requirement [2].
+
+***
+
+## II. BACKGROUND
+
+### A. CXL Architecture and the Fabric Manager
+CXL is a cache-coherent interconnect that supports pooled memory devices accessible by multiple hosts through a CXL fabric switch [1]. The Fabric Manager (FM) is defined as an "external logical process" responsible for configuring the CXL fabric (CXL 4.0 Spec, Section 7.6.1) [1]. It communicates with CXL switches and devices using the FM API, a set of management commands transported over MCTP [1]. The FM API defines commands for physical port management (opcodes 0x5100–0x510F), vPPB management (opcodes 0x5200–0x520F), Multi-Logical Device (MLD) management (opcodes 0x5300–0x540F), DCD management (opcodes 0x5600–0x5607), and switch management (opcodes 0x5700–0x5716) (CXL 4.0 Spec, Table 8-397) [1].
+
+### B. SPDM Authentication in CXL
+CXL requires devices to support the Security Protocol and Data Model (SPDM) for device identity verification and secure session establishment [1]. However, the CXL specification language governing whether SPDM sessions *must* be used for FM API command transport is consistently permissive. Transport security is explicitly noted as optional, stating that commands "may be transported" via SPDM (CXL 4.0 Spec, Section 7.6.3) [1].
+
+### C. Dynamic Capacity Devices and Hardware Sanitization
+A DCD exposes DC Regions from which the FM allocates extents to hosts using `Initiate Dynamic Capacity Add` and `Initiate Dynamic Capacity Release` commands (CXL 4.0 Spec, Section 7.6.7.6) [1]. Under the TSP, when capacity is forcefully removed, the target hardware is mandated to automatically overwrite or cryptographically scramble the data before the capacity can be reassigned to prevent data leakage (CXL 4.0 Spec, Section 8.2.10.9.9.4 and Table 7-73) [1].
+
+***
+
+## III. NORMATIVE GAP ANALYSIS
+
+We identified five normative gaps in the CXL 4.0 specification that expose multi-tenant fabrics to availability failures and unauthorized command execution.
+
+*   **GAP-1: No payload authentication fields.** An audit of the FM API command payload tables (e.g., Table 7-35 for `Bind vPPB` and Table 7-73 for `Initiate Dynamic Capacity Release`) confirms there are no HMACs, nonces, or signature fields required in the command structure itself [1]. An attacker who crafts a valid opcode and payload can issue any FM API command [2].
+*   **GAP-2: Optional SPDM session binding.** The specification uses permissive language rather than mandatory language for transport security, stating that commands *may* be transported via SPDM (CXL 4.0 Spec, Section 7.6.3) [1]. Because it is optional, hardware will accept unencrypted, unauthenticated MCTP packets by default [2].
+*   **GAP-3: Routing table divergence.** The FM is an external software process that creates an "inventory" of devices and bindings (CXL 4.0 Spec, Section 7.6.6.2) [1]. Because it is external software, if an unauthenticated attacker manipulates the switch hardware directly, the FM's software inventory diverges silently from the hardware state [1], [2].
+*   **GAP-4: No DCD extent cryptographic binding.** Dynamic Capacity allocation relies on standard payloads and tags (CXL 4.0 Spec, Table 7-73), not cryptographic session bindings to the target memory device [1]. The device accepts capacity release commands from any MCTP source [2].
+*   **GAP-5: Tunnel attestation missing.** The `Tunnel Management Command` (Opcode 0x5300) instructs the switch to encapsulate and forward a command to a target device (CXL 4.0 Spec, Section 7.6.7.3.1) [1]. The switch forwards the inner payload (Table 7-39) but mandates no check on the cryptographic origin of that inner command [1], [2].
+
+***
+
+## IV. THREAT MODEL
+
+We explicitly define our attacker as an **unauthenticated network attacker on the MCTP bus**, not a compromised Fabric Manager [2]. A compromised FM executing destructive commands is an accepted threat model boundary in CXL. Our vulnerability lies in the fact that the architecture allows an unprivileged entity to spoof the FM [2].
+
+**Attacker Capabilities:**
+*   The attacker has obtained MCTP bus access (e.g., through a compromised host OS on one tenant's server or a process on the management network) [2].
+*   The attacker knows or can enumerate valid CXL Endpoint IDs (EIDs) (discoverable via `Get Physical Port State` broadcasts) [2].
+*   The attacker does not possess the FM software daemon's process credentials, root access on the legitimate orchestrator, or physical access to the switch hardware [2].
+*   The attacker exploits the absence of mandatory SPDM authentication (GAP-2) to send raw commands directly to the hardware [2].
+
+***
+
+## V. ATTACK DESIGN
+
+### A. ATK-1: vPPB-Rebind (Forced Unbind DoS)
+**Objective:** Sever a victim tenant's connection and hijack the routing path [2].
+
+**Mechanism:** CXL switches fundamentally prohibit the FM from tunneling CXL.io memory requests to any port that is actively bound to a host (CXL 4.0 Spec, Section 7.2.3.1) [1]. To bypass this, the unauthenticated attacker issues an `Unbind vPPB` command (Opcode 0x5202, Table 7-36) over the MCTP bus [1]. Because SPDM is optional (GAP-2) and the payload lacks an HMAC (GAP-1), the switch blindly executes it [1], [2]. When unbound, the port becomes FM-owned, acting as a Surprise Removal (DoS) for the host. The FM software routing table now diverges from the hardware state (GAP-3) [2].
+
+```mermaid
+sequenceDiagram
+    participant Attacker as Unauthenticated Attacker
+    participant Switch as CXL Switch (Hardware)
+    participant Victim as Victim Tenant
+    Note over Attacker,Switch: No SPDM authentication required (GAP-1, GAP-2)
+    Attacker->>Switch: UNBIND_VPPB (opcode 0x5202)
+    Switch->>Victim: Detach physical binding (Surprise Removal DoS)
+    Switch-->>Attacker: UNBIND_RESPONSE
+    Attacker->>Switch: BIND_VPPB (opcode 0x5201) to attacker LD
+    Switch->>Switch: Updates hardware routing table
+    Note over Switch: Hardware routing table now diverges<br/>from FM software inventory (GAP-3)
+```
+
+### B. ATK-2: PortDoS (Architecturally Sanctioned DoS)
+**Objective:** Disable a shared upstream switch port, severing connectivity for all tenants [2].
+
+**Mechanism:** Exploiting the fact that physical port control requires no token (GAP-1), the unauthenticated attacker sends a `Set Physical Port State` command (Opcode 0x5101, Table 7-19) to disable the port [1], [2]. Because the specification explicitly accepts DoS as out of scope, the hardware complies, instantly taking down the multi-tenant topology [1].
+
+```mermaid
+sequenceDiagram
+    participant Attacker as Unauthenticated Attacker
+    participant Switch as CXL Switch
+    participant Victims as All Tenants on Port
+    Attacker->>Switch: GET_PHYSICAL_PORT_STATE (opcode 0x5100)
+    Switch-->>Attacker: Port list + states
+    Attacker->>Switch: SET_PHY_PORT_STATE (opcode 0x5101, DISABLED)
+    Switch->>Victims: Port physically disabled
+    Note over Victims: Massive Denial of Service
+```
+
+### C. ATK-3: DCDrain (Forced Removal Data Destruction)
+**Objective:** Leverage hardware sanitization to instantly destroy a victim's active memory [2].
+
+**Mechanism:** The attacker sends an `Initiate Dynamic Capacity Release` (Opcode 0x5605, Table 7-73) directly to the DCD device, bypassing the FM entirely (GAP-4) [1], [2]. The attacker sets the **Forced Removal** flag (Bit 4) to 1 [1]. Under the TSP, to prevent data leakage during a forced removal, the hardware automatically executes cryptographic scrambling or overwriting (Sanitize on Release) if Bit 5 is set or by default depending on the security policy [1]. The attacker thus leverages the device's own confidentiality mechanisms to permanently destroy the victim's data (e.g., an LLM KV-Cache) without the host OS receiving a warning interrupt [2].
+
+```mermaid
+sequenceDiagram
+    participant Attacker as Unauthenticated Attacker
+    participant DCD as DCD Device Hardware
+    participant Victim as Victim Tenant Host
+    Note over Attacker,DCD: Direct MCTP access bypasses FM (GAP-4)
+    Attacker->>DCD: DCD_RELEASE_CAPACITY (opcode 0x5605) + Forced Removal Flag
+    Note over DCD: Hardware triggers Sanitize on Release (TSP)
+    DCD->>DCD: Cryptographically scrambles / overwrites victim data
+    Note over Victim: Live LLM KV-cache memory permanently destroyed.<br/>No OS interrupt generated.
+```
+
+### D. ATK-4: TunnelSpoof (The LD Pool CCI Pivot)
+**Objective:** Pivot from a single isolated physical Head to gain global management over all tenants on a Multi-Headed Device [2].
+
+**Mechanism:** CXL 4.0 mandates that Multi-Headed Devices expose a global LD Pool CCI accessible via tunneling (CXL 4.0 Spec, Section 2.5) [1]. The attacker issues the `Tunnel Management Command` (Opcode 0x5300, Table 7-39) setting the Target Type to 1h (LD Pool CCI) [1]. The outer switch strips the header and forwards the encapsulated command to the global LD Pool CCI without verifying the inner command's cryptographic authorization (GAP-5) [1], [2]. The attacker successfully pivots out of their isolated physical head to gain execution rights over logical devices assigned to other tenants [2].
+
+```mermaid
+sequenceDiagram
+    participant Attacker as Unauthenticated Attacker
+    participant OuterSwitch as Outer CXL Switch
+    participant InnerDevice as Global LD Pool CCI (Target)
+    Attacker->>OuterSwitch: TUNNEL_MANAGEMENT_COMMAND (opcode 0x5300, Target Type 1h)
+    Note over OuterSwitch: Switch strips outer header.<br/>No cryptographic check on inner origin (GAP-5).
+    OuterSwitch->>InnerDevice: Forwards encapsulated FM API command
+    InnerDevice->>InnerDevice: Executes command (believes it is from FM)
+    InnerDevice-->>OuterSwitch: Response
+    OuterSwitch-->>Attacker: TUNNEL_RESPONSE
+```
+
+***
+
+## VI. EVALUATION
+
+### A. Simulation Environment and Results
+We implemented a Python-based CXL fabric simulator utilizing four modules: `FabricModel`, `MCTPBus`, `DCDModel`, and `AttackHarness` [2]. Each attack was executed for 1,000 Monte-Carlo trials with randomized victim tenant IDs and target ports [2]. 
+
+Because the CXL specification inherently lacks mandatory payload authentication for these control-plane operations, all four attacks achieved a **100% success rate** in simulation [2]. While previous drafts of this research extrapolated specific sub-microsecond physical latencies over the SMBus, we note that actual execution times will vary heavily depending on the out-of-band physical transport layer utilized (e.g., I2C, I3C, or PCIe VDMs). Regardless of physical transport speed, the logical success of the attacks is guaranteed by the current normative rules of the specification.
+
+### B. Limitations
+Our proposed software and hardware defenses target control-plane operations (the FM API), which are decoupled from the high-speed CXL.mem data-plane coherency traffic (CXL 4.0 Spec, Section 9.20.1) [1]. However, the precise latency overhead introduced by cryptographic token verification and SPDM binding on these specific management operations remains unmeasured in silicon and is flagged as future work [2].
+
+***
+
+## VII. DEFENSE MECHANISMS AND STANDARDIZATION ROADMAP
+
+To address the lack of control-plane authentication without breaking CXL.mem coherency protocols, we propose a four-layer defense architecture targeting CXL 5.0 Engineering Change Requests (ECRs) [2].
+
+**D1: Hardware-Anchored Ownership Registers (ECR-FM-SEC-03)**
+Each vPPB and DCD extent must be backed by a hardware ownership register in the switch ASIC that records the authoritative FM's SPDM device identity [2]. The switch acts as a zero-trust enforcer, rejecting commands mutating vPPB bindings or extent states unless the identity matches, mitigating GAP-3 and GAP-4 [2].
+
+**D2: Mandatory SPDM + RATS Session Binding (ECR-FM-SEC-02)**
+The CXL specification must change the language in Section 7.6.1 from "may" to "shall" [1], [2]. Forcing all FM API commands to be encrypted and integrity-protected at the transport layer neutralizes the Dolev-Yao network attacker [2].
+
+**D3: Orchestrator-Signed Command Tokens (ECR-FM-SEC-01)**
+FM API payloads must include a mandatory `CommandToken` field (an HMAC-SHA-256 keyed by the SPDM session) over the command opcode, payload, and sequence number [2]. This directly patches GAP-1 and provides replay protection without altering the physical link layer [2].
+
+**D4: Per-Tenant Tunnel Attestation (ECR-FM-SEC-04)**
+CXL Tunnel Management Commands (Table 7-39) must be extended with a mandatory `TunnelOriginToken` field [1], [2]. This preserves legitimate tunneling functionality but forces the outer switch to cryptographically verify the inner command's origin before forwarding it to the target device, closing GAP-5 [2].
+
+***
+
+## VIII. CONCLUSION
+
+While CXL 4.0 successfully guarantees data confidentiality via the Trusted Execution Environment Security Protocol (TSP) [1], its reliance on optional transport security leaves the management bus highly vulnerable [1], [2]. FMAttack demonstrates that an unauthenticated network attacker can bypass the Fabric Manager software entirely [2]. By exploiting documented specification gaps, an attacker can issue raw control-plane commands to forcefully unbind tenants, instantly destroy active memory via hardware sanitization, and pivot across isolated physical heads [2]. By implementing mandatory SPDM binding, orchestrator-signed payload tokens, and hardware-anchored ownership registers, the CXL Consortium can elevate multi-tenant availability to the same tier of protection as confidentiality [2].
